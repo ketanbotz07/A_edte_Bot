@@ -3,22 +3,26 @@ import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
-import ffmpeg
-import subprocess # FFmpeg को सीधे चलाने के लिए
+import requests # ⬅️ Mux API कॉल करने के लिए
+import json
+import base64
+import time
 
 # ---------------- CONFIG ----------------
 PORT_NUMBER = int(os.environ.get("PORT", 8080))
-FILE_SIZE_LIMIT = 10 * 1024 * 1024  # ⬅️ 10 MB की साइज़ लिमिट
+# Mux API Keys को Environment Variables से लें
+MUX_ACCESS_TOKEN_ID = os.environ.get("MUX_ACCESS_TOKEN_ID")
+MUX_SECRET_KEY = os.environ.get("MUX_SECRET_KEY")
 
-API_ID = os.environ.get("API_ID")
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# Mux API Endpoints
+MUX_API_BASE = "https://api.mux.com"
 
+# Pyrogram Client Setup
 app = Client(
     "video_editor_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    api_id=os.environ.get("API_ID"),
+    api_hash=os.environ.get("API_HASH"),
+    bot_token=os.environ.get("BOT_TOKEN")
 )
 
 # ------------ HEALTH CHECK SERVER ------------
@@ -37,10 +41,46 @@ def start_health_server():
     except Exception as e:
         print(f"Health Server Error: {e}")
 
-
-# ------------- GLOBAL VIDEO QUEUE (CPU SAFE) -------------
-# सुनिश्चित करें कि एक समय में केवल 1 FFmpeg प्रोसेस चले
+# ------------- GLOBAL LOCK (CPU SAFE) -------------
 video_lock = asyncio.Lock()    
+
+# -------------------- MUX HELPER FUNCTIONS --------------------
+
+def get_mux_headers():
+    """Mux API के लिए Basic Auth हेडर तैयार करें"""
+    if not MUX_ACCESS_TOKEN_ID or not MUX_SECRET_KEY:
+        raise ValueError("MUX API Keys are missing in Environment Variables.")
+    
+    # Basic Auth हेडर बनाने के लिए ID और Key को Base64 में एन्कोड करें
+    credentials = f"{MUX_ACCESS_TOKEN_ID}:{MUX_SECRET_KEY}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+    
+    return {
+        "Authorization": f"Basic {encoded_credentials}",
+        "Content-Type": "application/json"
+    }
+
+def create_mux_upload_url():
+    """Mux से एक नया डायरेक्ट अपलोड URL प्राप्त करें"""
+    url = f"{MUX_API_BASE}/video/v1/uploads"
+    
+    # यह payload Mux को बताता है कि वीडियो अपलोड होने के बाद उसे कैसे प्रोसेस करना है।
+    payload = {
+        "new_asset_settings": {
+            # 'passthrough' का उपयोग आप अपनी पहचान के लिए कर सकते हैं
+            "passthrough": f"telegram_user_{time.time()}",
+            "playback_policy": ["public"] 
+        },
+        # Direct Upload टाइप चुनें
+        "test": True # टेस्टिंग मोड में रखें (आप इसे हटा सकते हैं जब आप तैयार हों)
+    }
+    
+    headers = get_mux_headers()
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    response.raise_for_status() # HTTP त्रुटि होने पर एक्सेप्शन उठाएँ
+    
+    data = response.json()['data']
+    return data['id'], data['url'] # upload_id और upload_url वापस करें
 
 
 # -------------------- START CMD --------------------
@@ -48,96 +88,85 @@ video_lock = asyncio.Lock()
 async def start_cmd(client, message):
     await message.reply_text(
         "नमस्ते! 👋\n\n"
-        "⚠️ CPU-safe mode में चल रहा है। मैं केवल **10 MB** से छोटी फ़ाइलों को प्रोसेस कर सकता हूँ।\n"
-        "मुझे 10 MB से छोटा वीडियो भेजें।"
+        "🚀 बॉट अब **Mux Cloud** का उपयोग करके वीडियो प्रोसेस करेगा। CPU क्रैश नहीं होगा!\n"
+        "मुझे कोई भी वीडियो भेजें।"
     )
 
-# -------------------- VIDEO PROCESS (SINGLE FUNCTION) --------------------
-@app.on_message(filters.video | filters.document) # वीडियो या डॉक्यूमेंट को प्रोसेस करें
+# -------------------- VIDEO PROCESS (MUX INTEGRATION) --------------------
+@app.on_message(filters.video | filters.document) 
 async def process_video(client, message):
 
-    # 1. फ़ाइल साइज़ चेक (सबसे पहले)
-    file = message.video or message.document
-    
-    if file and file.file_size > FILE_SIZE_LIMIT:
-        print(f"--- FILE TOO LARGE: {round(file.file_size / (1024*1024))} MB ---")
-        await message.reply_text(
-            f"❌ यह फ़ाइल बहुत बड़ी है ({round(file.file_size / (1024*1024))} MB)। \
-            फ़्री टियर की मेमोरी सीमा के कारण मैं केवल 10 MB से छोटी फ़ाइलों को ही प्रोसेस कर सकता हूँ।"
-        )
-        return # अगर बड़ा है तो यहीं रुक जाएँ
-
-    # अगर साइज़ ठीक है, तो प्रोसेसिंग शुरू करें
     status = await message.reply_text("वीडियो प्राप्त हुआ है… कृपया प्रतीक्षा करें…")
-    
     input_path = None
-    output_path = None
-
-    async with video_lock:       # --------- QUEUE SYSTEM -------------
-        await status.edit_text("🔄 Encoding queue में आपका नंबर आ गया है…")
+    
+    async with video_lock:
+        await status.edit_text("🔄 Mux क्लाउड के लिए प्रोसेसिंग शुरू...")
 
         try:
-            # -------- Download --------
-            await status.edit_text("⬇ वीडियो डाउनलोड हो रहा है…")
+            # 1. वीडियो डाउनलोड करें (डिस्क पर)
+            await status.edit_text("⬇ वीडियो डाउनलोड हो रहा है (लोकल डिस्क पर)...")
             input_path = await message.download()
-            output_path = f"rotated_{os.path.basename(input_path)}"
-
-            # -------- Process (CPU/Memory Optimized FFmpeg) --------
-            await status.edit_text("⚙ प्रोसेसिंग शुरू… (Optimized Mode)")
-
-            # FFmpeg को सीधे subprocess से चलाएं (जो कभी-कभी ffmpeg-python से बेहतर होता है)
-            command = [
-                'ffmpeg',
-                '-i', input_path,
-                '-vf', 'transpose=1', # 90 डिग्री घुमाने का कमांड
-                '-c:v', 'libx264',    # वीडियो कोडेक
-                '-preset', 'ultrafast', # सबसे तेज एनकोडिंग
-                '-crf', '28',         # क्वालिटी थोड़ी कम करें, साइज़ कम करें
-                '-threads', '1',      # 1 CPU कोर का उपयोग करें
-                output_path
-            ]
             
-            # subprocess से चलाएँ और त्रुटि की जाँच करें
-            subprocess.run(command, check=True, capture_output=True)
+            # 2. Mux से अपलोड URL प्राप्त करें
+            await status.edit_text("🔗 Mux से अपलोड URL प्राप्त किया जा रहा है...")
+            upload_id, upload_url = await asyncio.to_thread(create_mux_upload_url)
+            
+            # 3. Mux पर अपलोड करें (सबसे धीमी प्रक्रिया)
+            await status.edit_text("⬆ वीडियो Mux क्लाउड पर अपलोड किया जा रहा है...")
+            
+            # फ़ाइल को सीधे Mux URL पर भेजें
+            with open(input_path, 'rb') as f:
+                # Mux डायरेक्ट अपलोड के लिए कोई Content-Type नहीं चाहिए, सिर्फ फाइल भेजें
+                upload_response = await asyncio.to_thread(requests.put, upload_url, data=f, headers={})
+            
+            upload_response.raise_for_status() # यदि अपलोड फेल हो तो एक्सेप्शन उठाएँ
 
-
-            # -------- Upload --------
-            await status.edit_text("⬆ वीडियो अपलोड किया जा रहा है…")
-
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=output_path,
-                caption="✅ आपका 90° घुमाया गया वीडियो तैयार है!",
+            # 4. स्टेटस अपडेट करें (Mux अब प्रोसेसिंग कर रहा है)
+            await status.edit_text(
+                "✅ अपलोड सफल! Mux अब वीडियो को प्रोसेस कर रहा है (यह 1-2 मिनट ले सकता है)।"
+                "\n\nआपको जल्द ही रिजल्ट मिलेगा। (ID: " + upload_id + ")"
+            )
+            
+            # ⚠️ यहाँ आपको Webhook सेटअप करना होगा ताकि Mux प्रोसेसिंग पूरी होने पर जवाब भेज सके।
+            # वर्तमान कोड Webhook के बिना, आपको रिजल्ट Telegram पर तुरंत नहीं भेजेगा।
+            
+            # 5. अंतिम संदेश
+            await status.edit_text(
+                f"✅ वीडियो Mux को सफलतापूर्वक भेजा गया। Mux इसकी प्रोसेसिंग शुरू कर चुका है। \
+                \n\n**नोट:** रिजल्ट पाने के लिए, हमें एक Webhook सर्वर की आवश्यकता है। यह बॉट अभी Webhook को नहीं सुन रहा है।"
             )
 
-            await status.delete()
 
-        except subprocess.CalledProcessError as e:
-            # FFmpeg कमांड फ़ेल होने पर त्रुटि
-            error_msg = f"❌ FFmpeg त्रुटि: {e.stderr.decode()[:150]}"
-            print(f"FFMPEG ERROR: {error_msg}")
-            await status.edit_text(error_msg)
+        except ValueError as ve:
+            # API Keys न होने पर त्रुटि
+            await status.edit_text(f"❌ कॉन्फ़िगरेशन त्रुटि: MUX API Keys नहीं मिले। कृपया Env Vars जाँचें।")
+            
+        except requests.exceptions.HTTPError as he:
+            # Mux से HTTP 4xx/5xx त्रुटि
+            error_details = he.response.text[:150]
+            await status.edit_text(f"❌ Mux API त्रुटि: HTTP फ़ेलियर। {error_details}")
             
         except Exception as e:
-            # अन्य सभी त्रुटियाँ (जैसे मेमोरी, डाउनलोडिंग)
-            error_msg = f"❌ प्रोसेसिंग में सामान्य त्रुटि: {str(e)[:150]}"
+            # अन्य त्रुटियाँ
+            error_msg = f"❌ सामान्य त्रुटि: {str(e)[:150]}"
             print(f"GENERAL ERROR: {error_msg}")
             await status.edit_text(error_msg)
 
         finally:
             # ---------- CLEANUP ----------
-            try:
-                # सुनिश्चित करें कि फ़ाइलें मौजूद हों तभी हटें
-                if input_path and os.path.exists(input_path):
-                    os.remove(input_path)
-                if output_path and os.path.exists(output_path):
-                    os.remove(output_path)
-            except Exception as e:
-                print(f"Cleanup failed: {e}")
+            if input_path and os.path.exists(input_path):
+                os.remove(input_path)
 
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
+    # Ensure Keys are present before starting
+    try:
+        get_mux_headers() 
+    except ValueError as e:
+        print(f"FATAL ERROR: {e}")
+        exit(1)
+
     threading.Thread(target=start_health_server, daemon=True).start()
     print("Bot Started...")
     app.run()
