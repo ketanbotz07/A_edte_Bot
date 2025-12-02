@@ -49,8 +49,27 @@ async def start_cmd(client, message):
         "मुझे कोई भी वीडियो भेजें – मैं उसे 90° घुमाकर वापस भेज दूंगा!"
     )
 
-
 # -------------------- VIDEO PROCESS --------------------
+# process_video फ़ंक्शन के अंदर:
+@app.on_message(filters.video | filters.document) 
+async def process_video(client, message):
+    
+    # 10 MB की लिमिट सेट करें (फ्री टियर के लिए सुरक्षित)
+    file_size_limit = 10 * 1024 * 1024 
+    file = message.video or message.document
+    
+    if file and file.file_size > file_size_limit:
+        # अगर साइज़ ज़्यादा है, तो जवाब दें और फंक्शन रोक दें
+        print(f"--- FILE TOO LARGE: {round(file.file_size / (1024*1024))} MB ---")
+        await message.reply_text(
+            f"❌ यह फ़ाइल बहुत बड़ी है ({round(file.file_size / (1024*1024))} MB)। \
+            फ़्री टियर की मेमोरी सीमा के कारण मैं केवल 10 MB से छोटी फ़ाइलों को ही प्रोसेस कर सकता हूँ।"
+        )
+        return # यहीं पर फंक्शन को रोक दें
+        
+    print(f"--- VIDEO RECEIVED... ---")
+    # ... बाकी प्रोसेसिंग कोड यहाँ जारी रहेगा
+
 @app.on_message(filters.video)
 async def process_video(client, message):
 
