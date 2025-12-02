@@ -6,7 +6,9 @@ from pyrogram import Client, filters
 import ffmpeg
 
 # ---------------- CONFIG ----------------
+# Health Check के लिए 8080 पोर्ट
 PORT_NUMBER = int(os.environ.get("PORT", 8080))
+FILE_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB की साइज़ लिमिट
 
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
@@ -37,7 +39,8 @@ def start_health_server():
 
 
 # ------------- GLOBAL VIDEO QUEUE (CPU SAFE) -------------
-video_lock = asyncio.Lock()    # ensure only 1 FFmpeg process at a time
+# सुनिश्चित करें कि एक समय में केवल 1 FFmpeg प्रोसेस चले
+video_lock = asyncio.Lock()    
 
 
 # -------------------- START CMD --------------------
@@ -45,35 +48,30 @@ video_lock = asyncio.Lock()    # ensure only 1 FFmpeg process at a time
 async def start_cmd(client, message):
     await message.reply_text(
         "नमस्ते! 👋\n\n"
-        "⚡ अब बॉट CPU-safe mode में चल रहा है.\n"
+        "⚡ बॉट CPU-safe mode में चल रहा है. (Max 10 MB फ़ाइल साइज़)\n"
         "मुझे कोई भी वीडियो भेजें – मैं उसे 90° घुमाकर वापस भेज दूंगा!"
     )
 
-# -------------------- VIDEO PROCESS --------------------
-# process_video फ़ंक्शन के अंदर:
-@app.on_message(filters.video | filters.document) 
+# -------------------- VIDEO PROCESS (SINGLE FUNCTION) --------------------
+@app.on_message(filters.video | filters.document) # दोनों फिल्टर एक साथ
 async def process_video(client, message):
-    
-    # 10 MB की लिमिट सेट करें (फ्री टियर के लिए सुरक्षित)
-    file_size_limit = 10 * 1024 * 1024 
+
+    # 1. फ़ाइल साइज़ चेक (सबसे पहले)
     file = message.video or message.document
     
-    if file and file.file_size > file_size_limit:
-        # अगर साइज़ ज़्यादा है, तो जवाब दें और फंक्शन रोक दें
+    if file and file.file_size > FILE_SIZE_LIMIT:
         print(f"--- FILE TOO LARGE: {round(file.file_size / (1024*1024))} MB ---")
         await message.reply_text(
             f"❌ यह फ़ाइल बहुत बड़ी है ({round(file.file_size / (1024*1024))} MB)। \
             फ़्री टियर की मेमोरी सीमा के कारण मैं केवल 10 MB से छोटी फ़ाइलों को ही प्रोसेस कर सकता हूँ।"
         )
-        return # यहीं पर फंक्शन को रोक दें
-        
-    print(f"--- VIDEO RECEIVED... ---")
-    # ... बाकी प्रोसेसिंग कोड यहाँ जारी रहेगा
+        return # अगर बड़ा है तो यहीं रुक जाएँ
 
-@app.on_message(filters.video)
-async def process_video(client, message):
-
+    # अगर साइज़ ठीक है, तो प्रोसेसिंग शुरू करें
     status = await message.reply_text("वीडियो प्राप्त हुआ है… कृपया प्रतीक्षा करें…")
+    
+    input_path = None
+    output_path = None
 
     async with video_lock:       # --------- QUEUE SYSTEM -------------
         await status.edit_text("🔄 Encoding queue में आपका नंबर आ गया है…")
@@ -95,7 +93,7 @@ async def process_video(client, message):
                     vcodec="libx264",
                     acodec="aac",
                     vf="transpose=1",
-                    preset="veryslow",   # ✔ CPU low
+                    preset="ultrafast",   # ✔ 'veryslow' को 'ultrafast' में बदला ताकि क्रैश न हो
                     crf=28,              # ✔ more compression
                     threads=1            # ✔ only 1 CPU core
                 )
@@ -114,14 +112,16 @@ async def process_video(client, message):
             await status.delete()
 
         except Exception as e:
-            await status.edit_text(f"❌ प्रोसेसिंग में त्रुटि: {str(e)[:150]}")
+            error_msg = f"❌ प्रोसेसिंग में त्रुटि: {str(e)[:150]}"
+            print(error_msg)
+            await status.edit_text(error_msg)
 
         finally:
             # ---------- CLEANUP ----------
             try:
-                if os.path.exists(input_path):
+                if input_path and os.path.exists(input_path):
                     os.remove(input_path)
-                if os.path.exists(output_path):
+                if output_path and os.path.exists(output_path):
                     os.remove(output_path)
             except:
                 pass
