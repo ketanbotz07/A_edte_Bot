@@ -4,13 +4,12 @@ FROM python:3.11-slim
 # वर्किंग डायरेक्टरी सेट करें
 WORKDIR /app
 
-# 1. FFmpeg और अन्य आवश्यक डिपेंडेंसी इंस्टॉल करें
-# ⚠️ सुनिश्चित करें कि यह 'ffmpeg' इंस्टॉल करता है ⚠️
+# 1. कोई FFmpeg इंस्टॉलेशन नहीं, सिर्फ़ apt अपडेट
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # 2. डिपेंडेंसी कॉपी करें और इंस्टॉल करें
+# (requests लाइब्रेरी यहां इंस्टॉल हो जाएगी)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
