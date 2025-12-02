@@ -4,11 +4,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 import ffmpeg
+import subprocess # FFmpeg को सीधे चलाने के लिए
 
 # ---------------- CONFIG ----------------
-# Health Check के लिए 8080 पोर्ट
 PORT_NUMBER = int(os.environ.get("PORT", 8080))
-FILE_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB की साइज़ लिमिट
+FILE_SIZE_LIMIT = 10 * 1024 * 1024  # ⬅️ 10 MB की साइज़ लिमिट
 
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
@@ -48,12 +48,12 @@ video_lock = asyncio.Lock()
 async def start_cmd(client, message):
     await message.reply_text(
         "नमस्ते! 👋\n\n"
-        "⚡ बॉट CPU-safe mode में चल रहा है. (Max 10 MB फ़ाइल साइज़)\n"
-        "मुझे कोई भी वीडियो भेजें – मैं उसे 90° घुमाकर वापस भेज दूंगा!"
+        "⚠️ CPU-safe mode में चल रहा है। मैं केवल **10 MB** से छोटी फ़ाइलों को प्रोसेस कर सकता हूँ।\n"
+        "मुझे 10 MB से छोटा वीडियो भेजें।"
     )
 
 # -------------------- VIDEO PROCESS (SINGLE FUNCTION) --------------------
-@app.on_message(filters.video | filters.document) # दोनों फिल्टर एक साथ
+@app.on_message(filters.video | filters.document) # वीडियो या डॉक्यूमेंट को प्रोसेस करें
 async def process_video(client, message):
 
     # 1. फ़ाइल साइज़ चेक (सबसे पहले)
@@ -82,23 +82,24 @@ async def process_video(client, message):
             input_path = await message.download()
             output_path = f"rotated_{os.path.basename(input_path)}"
 
-            # -------- Process (Low CPU FFmpeg) --------
-            await status.edit_text("⚙ प्रोसेसिंग शुरू… (Low-CPU Mode)")
+            # -------- Process (CPU/Memory Optimized FFmpeg) --------
+            await status.edit_text("⚙ प्रोसेसिंग शुरू… (Optimized Mode)")
 
-            (
-                ffmpeg
-                .input(input_path)
-                .output(
-                    output_path,
-                    vcodec="libx264",
-                    acodec="aac",
-                    vf="transpose=1",
-                    preset="ultrafast",   # ✔ 'veryslow' को 'ultrafast' में बदला ताकि क्रैश न हो
-                    crf=28,              # ✔ more compression
-                    threads=1            # ✔ only 1 CPU core
-                )
-                .run(overwrite_output=True)
-            )
+            # FFmpeg को सीधे subprocess से चलाएं (जो कभी-कभी ffmpeg-python से बेहतर होता है)
+            command = [
+                'ffmpeg',
+                '-i', input_path,
+                '-vf', 'transpose=1', # 90 डिग्री घुमाने का कमांड
+                '-c:v', 'libx264',    # वीडियो कोडेक
+                '-preset', 'ultrafast', # सबसे तेज एनकोडिंग
+                '-crf', '28',         # क्वालिटी थोड़ी कम करें, साइज़ कम करें
+                '-threads', '1',      # 1 CPU कोर का उपयोग करें
+                output_path
+            ]
+            
+            # subprocess से चलाएँ और त्रुटि की जाँच करें
+            subprocess.run(command, check=True, capture_output=True)
+
 
             # -------- Upload --------
             await status.edit_text("⬆ वीडियो अपलोड किया जा रहा है…")
@@ -111,20 +112,28 @@ async def process_video(client, message):
 
             await status.delete()
 
+        except subprocess.CalledProcessError as e:
+            # FFmpeg कमांड फ़ेल होने पर त्रुटि
+            error_msg = f"❌ FFmpeg त्रुटि: {e.stderr.decode()[:150]}"
+            print(f"FFMPEG ERROR: {error_msg}")
+            await status.edit_text(error_msg)
+            
         except Exception as e:
-            error_msg = f"❌ प्रोसेसिंग में त्रुटि: {str(e)[:150]}"
-            print(error_msg)
+            # अन्य सभी त्रुटियाँ (जैसे मेमोरी, डाउनलोडिंग)
+            error_msg = f"❌ प्रोसेसिंग में सामान्य त्रुटि: {str(e)[:150]}"
+            print(f"GENERAL ERROR: {error_msg}")
             await status.edit_text(error_msg)
 
         finally:
             # ---------- CLEANUP ----------
             try:
+                # सुनिश्चित करें कि फ़ाइलें मौजूद हों तभी हटें
                 if input_path and os.path.exists(input_path):
                     os.remove(input_path)
                 if output_path and os.path.exists(output_path):
                     os.remove(output_path)
-            except:
-                pass
+            except Exception as e:
+                print(f"Cleanup failed: {e}")
 
 
 # -------------------- MAIN --------------------
