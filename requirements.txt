@@ -1,3 +1,4 @@
 pyrogram
 requests
-ffmpeg-python
+fastapi
+avicorn[standard]
